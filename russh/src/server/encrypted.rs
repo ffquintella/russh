@@ -642,22 +642,25 @@ impl Session {
                 }
                 self.flush()?;
                 if let Some(ext) = ext {
+                    // PATCH (Rustion): try_send instead of .send().await to
+                    // avoid session deadlock when the Channel receiver is full
+                    // — see the client-side CHANNEL_DATA patch for rationale.
+                    // The handler callback path still delivers the data, so
+                    // dropping the Channel-path message is harmless for
+                    // handler-only consumers.
                     if let Some(chan) = self.channels.get(&channel_num) {
-                        chan.send(ChannelMsg::ExtendedData {
+                        let _ = chan.try_send(ChannelMsg::ExtendedData {
                             ext,
                             data: data.clone(),
-                        })
-                        .await
-                        .unwrap_or(())
+                        });
                     }
                     handler.extended_data(channel_num, ext, &data, self).await
                 } else {
+                    // PATCH (Rustion): try_send — see comment above.
                     if let Some(chan) = self.channels.get(&channel_num) {
-                        chan.send(ChannelMsg::Data {
+                        let _ = chan.try_send(ChannelMsg::Data {
                             data: data.clone(),
-                        })
-                        .await
-                        .unwrap_or(())
+                        });
                     }
                     handler.data(channel_num, &data, self).await
                 }

@@ -447,8 +447,19 @@ impl Session {
                     }
                 }
 
+                // PATCH (Rustion): use try_send instead of .send().await so the
+                // session loop never blocks when the Channel's bounded receiver
+                // is full. Consumers that don't drain the Channel receiver
+                // (e.g. proxies using only the Handler callback path) would
+                // otherwise deadlock the session, preventing WINDOW_ADJUST
+                // packets from being sent and stalling the connection under
+                // heavy output (ps aux, top, last).
+                //
+                // The data is still delivered via `client.data(...)` below, so
+                // dropping the Channel-path message is harmless for handler-only
+                // consumers.
                 if let Some(chan) = self.channels.get(&channel_num) {
-                    let _ = chan.send(ChannelMsg::Data { data: data.clone() }).await;
+                    let _ = chan.try_send(ChannelMsg::Data { data: data.clone() });
                 }
 
                 client.data(channel_num, &data, self).await
@@ -469,13 +480,13 @@ impl Session {
                     }
                 }
 
+                // PATCH (Rustion): try_send to avoid session deadlock — see
+                // CHANNEL_DATA case above for rationale.
                 if let Some(chan) = self.channels.get(&channel_num) {
-                    let _ = chan
-                        .send(ChannelMsg::ExtendedData {
-                            ext: extended_code,
-                            data: data.clone(),
-                        })
-                        .await;
+                    let _ = chan.try_send(ChannelMsg::ExtendedData {
+                        ext: extended_code,
+                        data: data.clone(),
+                    });
                 }
 
                 client
