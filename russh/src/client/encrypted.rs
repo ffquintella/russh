@@ -397,8 +397,9 @@ impl Session {
                 // Forward the close to the channel before removing it, so that
                 // consumers waiting on `Channel::wait()` receive an explicit
                 // `ChannelMsg::Close` instead of just seeing `None`.
+                // PATCH (Rustion): try_send — see CHANNEL_DATA patch for rationale.
                 if let Some(chan) = self.channels.get(&channel_num) {
-                    let _ = chan.send(ChannelMsg::Close).await;
+                    let _ = chan.try_send(ChannelMsg::Close);
                 }
                 self.channels.remove(&channel_num);
                 client.channel_close(channel_num, self).await
@@ -406,8 +407,9 @@ impl Session {
             Some((&msg::CHANNEL_EOF, mut r)) => {
                 debug!("channel_eof");
                 let channel_num = map_err!(ChannelId::decode(&mut r))?;
+                // PATCH (Rustion): try_send — see CHANNEL_DATA patch for rationale.
                 if let Some(chan) = self.channels.get(&channel_num) {
-                    let _ = chan.send(ChannelMsg::Eof).await;
+                    let _ = chan.try_send(ChannelMsg::Eof);
                 }
                 client.channel_eof(channel_num, self).await
             }
@@ -501,16 +503,18 @@ impl Session {
                     "xon-xoff" => {
                         map_err!(u8::decode(&mut r))?; // should be 0.
                         let client_can_do = map_err!(u8::decode(&mut r))? != 0;
+                        // PATCH (Rustion): try_send — see CHANNEL_DATA patch.
                         if let Some(chan) = self.channels.get(&channel_num) {
-                            let _ = chan.send(ChannelMsg::XonXoff { client_can_do }).await;
+                            let _ = chan.try_send(ChannelMsg::XonXoff { client_can_do });
                         }
                         client.xon_xoff(channel_num, client_can_do, self).await
                     }
                     "exit-status" => {
                         map_err!(u8::decode(&mut r))?; // should be 0.
                         let exit_status = map_err!(u32::decode(&mut r))?;
+                        // PATCH (Rustion): try_send — see CHANNEL_DATA patch.
                         if let Some(chan) = self.channels.get(&channel_num) {
-                            let _ = chan.send(ChannelMsg::ExitStatus { exit_status }).await;
+                            let _ = chan.try_send(ChannelMsg::ExitStatus { exit_status });
                         }
                         client.exit_status(channel_num, exit_status, self).await
                     }
@@ -521,15 +525,14 @@ impl Session {
                         let core_dumped = map_err!(u8::decode(&mut r))? != 0;
                         let error_message = map_err!(String::decode(&mut r))?;
                         let lang_tag = map_err!(String::decode(&mut r))?;
+                        // PATCH (Rustion): try_send — see CHANNEL_DATA patch.
                         if let Some(chan) = self.channels.get(&channel_num) {
-                            let _ = chan
-                                .send(ChannelMsg::ExitSignal {
-                                    signal_name: signal_name.clone(),
-                                    core_dumped,
-                                    error_message: error_message.to_string(),
-                                    lang_tag: lang_tag.to_string(),
-                                })
-                                .await;
+                            let _ = chan.try_send(ChannelMsg::ExitSignal {
+                                signal_name: signal_name.clone(),
+                                core_dumped,
+                                error_message: error_message.to_string(),
+                                lang_tag: lang_tag.to_string(),
+                            });
                         }
                         client
                             .exit_signal(
@@ -649,15 +652,17 @@ impl Session {
             }
             Some((&msg::CHANNEL_SUCCESS, mut r)) => {
                 let channel_num = map_err!(ChannelId::decode(&mut r))?;
+                // PATCH (Rustion): try_send — see CHANNEL_DATA patch.
                 if let Some(chan) = self.channels.get(&channel_num) {
-                    let _ = chan.send(ChannelMsg::Success).await;
+                    let _ = chan.try_send(ChannelMsg::Success);
                 }
                 client.channel_success(channel_num, self).await
             }
             Some((&msg::CHANNEL_FAILURE, mut r)) => {
                 let channel_num = map_err!(ChannelId::decode(&mut r))?;
+                // PATCH (Rustion): try_send — see CHANNEL_DATA patch.
                 if let Some(chan) = self.channels.get(&channel_num) {
-                    let _ = chan.send(ChannelMsg::Failure).await;
+                    let _ = chan.try_send(ChannelMsg::Failure);
                 }
                 client.channel_failure(channel_num, self).await
             }

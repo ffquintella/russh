@@ -605,8 +605,9 @@ impl Session {
                 // Forward the close to the channel before removing it, so that
                 // consumers waiting on `Channel::wait()` receive an explicit
                 // `ChannelMsg::Close` instead of just seeing `None`.
+                // PATCH (Rustion): try_send — see CHANNEL_DATA patch.
                 if let Some(chan) = self.channels.get(&channel_num) {
-                    chan.send(ChannelMsg::Close).await.unwrap_or(())
+                    let _ = chan.try_send(ChannelMsg::Close);
                 }
                 self.channels.remove(&channel_num);
                 debug!("handler.channel_close {channel_num:?}");
@@ -614,8 +615,9 @@ impl Session {
             }
             msg::CHANNEL_EOF => {
                 let channel_num = map_err!(ChannelId::decode(r))?;
+                // PATCH (Rustion): try_send — see CHANNEL_DATA patch.
                 if let Some(chan) = self.channels.get(&channel_num) {
-                    chan.send(ChannelMsg::Eof).await.unwrap_or(())
+                    let _ = chan.try_send(ChannelMsg::Eof);
                 }
                 debug!("handler.channel_eof {channel_num:?}");
                 handler.channel_eof(channel_num, self).await
@@ -933,12 +935,11 @@ impl Session {
                     }
                     "signal" => {
                         let signal = Sig::from_name(&map_err!(String::decode(r))?);
+                        // PATCH (Rustion): try_send — see CHANNEL_DATA patch.
                         if let Some(chan) = self.channels.get(&channel_num) {
-                            chan.send(ChannelMsg::Signal {
+                            let _ = chan.try_send(ChannelMsg::Signal {
                                 signal: signal.clone(),
-                            })
-                            .await
-                            .unwrap_or(())
+                            });
                         }
                         debug!("handler.signal {channel_num:?} {signal:?}");
                         handler.signal(channel_num, signal, self).await
