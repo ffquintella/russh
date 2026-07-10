@@ -34,7 +34,7 @@ _bench = ["dep:criterion"]
 aead_0_6 = { package = "aead", version = "=0.6.0-rc.10" }
 aes.workspace = true
 aes_0_9 = { package = "aes", version = "0.9.0" }
-aes_gcm_0_11 = { package = "aes-gcm", version = "=0.11.0-rc.3" }
+aes_gcm_0_11 = { package = "aes-gcm", version = "=0.11.0-rc.4" }
 async-trait = { workspace = true, optional = true }
 aws-lc-rs = { version = "1.16.2", optional = true }
 bitflags = "2.0"
