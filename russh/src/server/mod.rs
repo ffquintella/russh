@@ -48,13 +48,13 @@ use tokio::net::{TcpListener, ToSocketAddrs};
 use tokio::pin;
 use tokio::sync::{broadcast, mpsc};
 
-use crate::cipher::{clear, OpeningKey};
-use crate::kex::dh::groups::{DhGroup, BUILTIN_SAFE_DH_GROUPS, DH_GROUP14};
+use crate::cipher::{OpeningKey, clear};
+use crate::kex::dh::groups::{BUILTIN_SAFE_DH_GROUPS, DH_GROUP14, DhGroup};
 use crate::kex::{KexProgress, SessionKexState};
 use crate::session::*;
 use crate::ssh_read::*;
 use crate::sshbuffer::*;
-use crate::{*};
+use crate::*;
 
 mod kex;
 mod session;
@@ -75,6 +75,8 @@ pub struct Config {
     pub auth_rejection_time_initial: Option<std::time::Duration>,
     /// The server's keys. The first key pair in the client's preference order will be chosen.
     pub keys: Vec<PrivateKey>,
+    /// The server's host certificates.
+    pub certificates: Vec<Certificate>,
     /// The bytes and time limits before key re-exchange.
     pub limits: Limits,
     /// The initial size of a channel (used for flow control).
@@ -108,10 +110,11 @@ impl Default for Config {
                 "_",
                 env!("CARGO_PKG_VERSION")
             ))),
-            methods: auth::MethodSet::all(),
+            methods: auth::MethodSet::server_supported(),
             auth_rejection_time: std::time::Duration::from_secs(1),
             auth_rejection_time_initial: None,
             keys: Vec::new(),
+            certificates: Vec::new(),
             window_size: 2097152,
             maximum_packet_size: 32768,
             channel_buffer_size: 100,
@@ -139,6 +142,7 @@ impl Debug for Config {
                 &self.auth_rejection_time_initial,
             )
             .field("keys", &"***")
+            .field("certificates", &"***")
             .field("window_size", &self.window_size)
             .field("maximum_packet_size", &self.maximum_packet_size)
             .field("channel_buffer_size", &self.channel_buffer_size)
@@ -211,18 +215,19 @@ impl Auth {
 pub trait Handler: Sized {
     type Error: From<crate::Error> + Send;
 
-    /// Check authentication using the "none" method. Russh makes
-    /// sure rejection happens in time `config.auth_rejection_time`,
+    /// Check authentication using the "none" method.
+    ///
+    /// Russh makes sure rejection takes a constant [`Config::auth_rejection_time`],
     /// except if this method takes more than that.
     #[allow(unused_variables)]
     fn auth_none(&mut self, user: &str) -> impl Future<Output = Result<Auth, Self::Error>> + Send {
         async { Ok(Auth::reject()) }
     }
 
-    /// Check authentication using the "password" method. Russh
-    /// makes sure rejection happens in time
-    /// `config.auth_rejection_time`, except if this method takes more
-    /// than that.
+    /// Check authentication using the "password" method.
+    ///
+    /// Russh makes sure rejection takes a constant [`Config::auth_rejection_time`],
+    /// except if this method takes more than that.
     #[allow(unused_variables)]
     fn auth_password(
         &mut self,
@@ -232,13 +237,30 @@ pub trait Handler: Sized {
         async { Ok(Auth::reject()) }
     }
 
-    /// Check authentication using the "publickey" method. This method
-    /// should just check whether the public key matches the
-    /// authorized ones. Russh then checks the signature. If the key
-    /// is unknown, or the signature is invalid, Russh guarantees
-    /// that rejection happens in constant time
-    /// `config.auth_rejection_time`, except if this method takes more
-    /// time than that.
+    /// Pre-authentication callback for public key authentication.
+    /// This method is called when a client is:
+    /// * probing public key authentication without a signature (yet) or
+    /// * attempting authentication with a signature without doing
+    ///   a prior probe.
+    ///
+    /// The purpose of this callback is to spare the effort of signing
+    /// and verifying the signature if the server will not accept this
+    /// public key anyway.
+    ///
+    /// Note that at this stage, the ownership of the key has
+    /// not been verified yet.
+    ///
+    /// You should not alter your session's authentication state
+    /// from this callback. Implement your actual authentication check
+    /// in [`Handler::auth_publickey`]. Seeing an unknown key here should
+    /// in most cases not be counted towards an eventual authentication
+    /// attempt limit.
+    ///
+    /// The default implementation accepts all keys, allowing them to
+    /// proceed to [`Handler::auth_publickey`].
+    ///
+    /// Russh makes sure rejection takes a constant [`Config::auth_rejection_time`],
+    /// except if this method takes more than that.
     #[allow(unused_variables)]
     fn auth_publickey_offered(
         &mut self,
@@ -251,9 +273,9 @@ pub trait Handler: Sized {
     /// Check authentication using the "publickey" method. This method
     /// is called after the signature has been verified and key
     /// ownership has been confirmed.
-    /// Russh guarantees that rejection happens in constant time
-    /// `config.auth_rejection_time`, except if this method takes more
-    /// time than that.
+    ///
+    /// Russh makes sure rejection takes a constant [`Config::auth_rejection_time`],
+    /// except if this method takes more than that.
     #[allow(unused_variables)]
     fn auth_publickey(
         &mut self,
@@ -266,9 +288,9 @@ pub trait Handler: Sized {
     /// Check authentication using an OpenSSH certificate. This method
     /// is called after the signature has been verified and key
     /// ownership has been confirmed.
-    /// Russh guarantees that rejection happens in constant time
-    /// `config.auth_rejection_time`, except if this method takes more
-    /// time than that.
+    ///
+    /// Russh makes sure rejection takes a constant [`Config::auth_rejection_time`],
+    /// except if this method takes more than that.
     #[allow(unused_variables)]
     fn auth_openssh_certificate(
         &mut self,
@@ -279,9 +301,10 @@ pub trait Handler: Sized {
     }
 
     /// Check authentication using the "keyboard-interactive"
-    /// method. Russh makes sure rejection happens in time
-    /// `config.auth_rejection_time`, except if this method takes more
-    /// than that.
+    /// method.
+    ///
+    /// Russh makes sure rejection takes a constant [`Config::auth_rejection_time`],
+    /// except if this method takes more than that.
     #[allow(unused_variables)]
     fn auth_keyboard_interactive<'a>(
         &'a mut self,
@@ -330,33 +353,45 @@ pub trait Handler: Sized {
         async { Ok(()) }
     }
 
-    /// Called when a new session channel is created.
-    /// Return value indicates whether the channel request should be granted.
+    /// Called when a new session channel is requested by the client.
+    ///
+    /// The handler receives a [`ChannelOpenHandle`] that must be used to accept or
+    /// reject the request. Dropping the handle without calling either method
+    /// automatically rejects the channel.
     #[allow(unused_variables)]
     fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
+        reply: ChannelOpenHandle,
         session: &mut Session,
-    ) -> impl Future<Output = Result<bool, Self::Error>> + Send {
-        async { Ok(false) }
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        async { Ok(()) }
     }
 
-    /// Called when a new X11 channel is created.
-    /// Return value indicates whether the channel request should be granted.
+    /// Called when a new X11 channel is requested by the client.
+    ///
+    /// The handler receives a [`ChannelOpenHandle`] that must be used to accept or
+    /// reject the request. Dropping the handle without calling either method
+    /// automatically rejects the channel.
     #[allow(unused_variables)]
     fn channel_open_x11(
         &mut self,
         channel: Channel<Msg>,
         originator_address: &str,
         originator_port: u32,
+        reply: ChannelOpenHandle,
         session: &mut Session,
-    ) -> impl Future<Output = Result<bool, Self::Error>> + Send {
-        async { Ok(false) }
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        async { Ok(()) }
     }
 
-    /// Called when a new direct TCP/IP ("local TCP forwarding") channel is opened.
-    /// Return value indicates whether the channel request should be granted.
+    /// Called when a new direct TCP/IP ("local TCP forwarding") channel is requested.
+    ///
+    /// The handler receives a [`ChannelOpenHandle`] that must be used to accept or
+    /// reject the request. Dropping the handle without calling either method
+    /// automatically rejects the channel.
     #[allow(unused_variables)]
+    #[allow(clippy::too_many_arguments)]
     fn channel_open_direct_tcpip(
         &mut self,
         channel: Channel<Msg>,
@@ -364,14 +399,21 @@ pub trait Handler: Sized {
         port_to_connect: u32,
         originator_address: &str,
         originator_port: u32,
+        reply: ChannelOpenHandle,
         session: &mut Session,
-    ) -> impl Future<Output = Result<bool, Self::Error>> + Send {
-        async { Ok(false) }
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        async { Ok(()) }
     }
 
     /// Called when a new remote forwarded TCP connection comes in.
+    ///
+    /// The handler receives a [`ChannelOpenHandle`] that must be used to accept or
+    /// reject the request. Dropping the handle without calling either method
+    /// automatically rejects the channel.
+    ///
     /// <https://www.rfc-editor.org/rfc/rfc4254#section-7>
     #[allow(unused_variables)]
+    #[allow(clippy::too_many_arguments)]
     fn channel_open_forwarded_tcpip(
         &mut self,
         channel: Channel<Msg>,
@@ -379,21 +421,26 @@ pub trait Handler: Sized {
         port_to_connect: u32,
         originator_address: &str,
         originator_port: u32,
+        reply: ChannelOpenHandle,
         session: &mut Session,
-    ) -> impl Future<Output = Result<bool, Self::Error>> + Send {
-        async { Ok(false) }
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        async { Ok(()) }
     }
 
-    /// Called when a new direct-streamlocal ("local UNIX socket forwarding") channel is created.
-    /// Return value indicates whether the channel request should be granted.
+    /// Called when a new direct-streamlocal ("local UNIX socket forwarding") channel is requested.
+    ///
+    /// The handler receives a [`ChannelOpenHandle`] that must be used to accept or
+    /// reject the request. Dropping the handle without calling either method
+    /// automatically rejects the channel.
     #[allow(unused_variables)]
     fn channel_open_direct_streamlocal(
         &mut self,
         channel: Channel<Msg>,
         socket_path: &str,
+        reply: ChannelOpenHandle,
         session: &mut Session,
-    ) -> impl Future<Output = Result<bool, Self::Error>> + Send {
-        async { Ok(false) }
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        async { Ok(()) }
     }
 
     /// Called when the client confirmed our request to open a
@@ -460,8 +507,9 @@ pub trait Handler: Sized {
     /// specifications.
     ///
     /// **Note:** Success or failure should be communicated to the client by calling
-    /// `session.channel_success(channel)` or `session.channel_failure(channel)` respectively. For
-    /// instance:
+    /// [`Session::channel_success`] or [`Session::channel_failure`] respectively.
+    ///
+    /// For instance:
     ///
     /// ```ignore
     /// async fn pty_request(
@@ -497,8 +545,9 @@ pub trait Handler: Sized {
     /// The client requests an X11 connection.
     ///
     /// **Note:** Success or failure should be communicated to the client by calling
-    /// `session.channel_success(channel)` or `session.channel_failure(channel)` respectively. For
-    /// instance:
+    /// [`Session::channel_success`] or [`Session::channel_failure`] respectively.
+    ///
+    /// For instance:
     ///
     /// ```ignore
     /// async fn x11_request(
@@ -532,8 +581,9 @@ pub trait Handler: Sized {
     /// environment to be set.
     ///
     /// **Note:** Success or failure should be communicated to the client by calling
-    /// `session.channel_success(channel)` or `session.channel_failure(channel)` respectively. For
-    /// instance:
+    /// [`Session::channel_success`] or [`Session::channel_failure`] respectively.
+    ///
+    /// For instance:
     ///
     /// ```ignore
     /// async fn env_request(
@@ -561,8 +611,9 @@ pub trait Handler: Sized {
     /// The client requests a shell.
     ///
     /// **Note:** Success or failure should be communicated to the client by calling
-    /// `session.channel_success(channel)` or `session.channel_failure(channel)` respectively. For
-    /// instance:
+    /// [`Session::channel_success`] or [`Session::channel_failure`] respectively.
+    ///
+    /// For instance:
     ///
     /// ```ignore
     /// async fn shell_request(
@@ -587,8 +638,9 @@ pub trait Handler: Sized {
     /// shell. Make sure to check the command before doing so.
     ///
     /// **Note:** Success or failure should be communicated to the client by calling
-    /// `session.channel_success(channel)` or `session.channel_failure(channel)` respectively. For
-    /// instance:
+    /// [`Session::channel_success`] or [`Session::channel_failure`] respectively.
+    ///
+    /// For instance:
     ///
     /// ```ignore
     /// async fn exec_request(
@@ -615,8 +667,9 @@ pub trait Handler: Sized {
     /// (such as sftp).
     ///
     /// **Note:** Success or failure should be communicated to the client by calling
-    /// `session.channel_success(channel)` or `session.channel_failure(channel)` respectively. For
-    /// instance:
+    /// [`Session::channel_success`] or [`Session::channel_failure`] respectively.
+    ///
+    /// For instance:
     ///
     /// ```ignore
     /// async fn subsystem_request(
@@ -642,8 +695,9 @@ pub trait Handler: Sized {
     /// The client's pseudo-terminal window size has changed.
     ///
     /// **Note:** Success or failure should be communicated to the client by calling
-    /// `session.channel_success(channel)` or `session.channel_failure(channel)` respectively. For
-    /// instance:
+    /// [`Session::channel_success`] or [`Session::channel_failure`] respectively.
+    ///
+    /// For instance:
     ///
     /// ```ignore
     /// async fn window_change_request(
@@ -675,8 +729,9 @@ pub trait Handler: Sized {
     /// The client requests OpenSSH agent forwarding
     ///
     /// **Note:** Success or failure should be communicated to the client by calling
-    /// `session.channel_success(channel)` or `session.channel_failure(channel)` respectively. For
-    /// instance:
+    /// [`Session::channel_success`] or [`Session::channel_failure`] respectively.
+    ///
+    /// For instance:
     ///
     /// ```ignore
     /// async fn agent_request(
@@ -753,6 +808,7 @@ pub trait Handler: Sized {
     }
 
     /// Override when enabling the `diffie-hellman-group-exchange-*` key exchange methods.
+    ///
     /// Should return a Diffie-Hellman group with a safe prime whose length is
     /// between `gex_params.min_group_size` and `gex_params.max_group_size` and
     /// (if possible) over and as close as possible to `gex_params.preferred_group_size`.
@@ -1010,8 +1066,10 @@ where
 
     // Reading SSH id and allocating a session.
     let mut stream = SshRead::new(stream);
+    let (priority_sender, priority_receiver) = tokio::sync::mpsc::unbounded_channel();
     let (sender, receiver) = tokio::sync::mpsc::channel(config.event_buffer_size);
     let handle = server::session::Handle {
+        priority_sender,
         sender,
         channel_buffer_size: config.channel_buffer_size,
     };
@@ -1020,6 +1078,7 @@ where
     let mut session = Session {
         target_window_size: common.config.window_size,
         common,
+        priority_receiver,
         receiver,
         sender: handle.clone(),
         pending_reads: Vec::new(),
@@ -1041,9 +1100,9 @@ async fn read_ssh_id<R: AsyncRead + Unpin>(
     read: &mut SshRead<R>,
 ) -> Result<CommonSession<Arc<Config>>, Error> {
     let sshid = if let Some(t) = config.inactivity_timeout {
-        tokio::time::timeout(t, read.read_ssh_id()).await??
+        tokio::time::timeout(t, read.read_client_ssh_id()).await??
     } else {
-        read.read_ssh_id().await?
+        read.read_client_ssh_id().await?
     };
 
     let session = CommonSession {
@@ -1077,7 +1136,11 @@ async fn reply<H: Handler + Send>(
             pkt.seqn.0,
             pkt.buffer.len()
         );
-        if session.common.strict_kex && session.common.encrypted.is_none() {
+        let strict_kex = match session.kex {
+            SessionKexState::InProgress(ref kex) => kex.strict_kex(),
+            _ => session.common.strict_kex,
+        };
+        if strict_kex && session.common.encrypted.is_none() {
             let seqno = pkt.seqn.0 - 1; // was incremented after read()
             validate_client_msg_strict_kex(*message_type, seqno as usize)?;
         }

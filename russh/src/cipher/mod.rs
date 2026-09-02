@@ -26,6 +26,7 @@ use aes::{Aes128, Aes192, Aes256};
 #[cfg(feature = "aws-lc-rs")]
 use aws_lc_rs::aead::{AES_128_GCM as ALGORITHM_AES_128_GCM, AES_256_GCM as ALGORITHM_AES_256_GCM};
 use byteorder::{BigEndian, ByteOrder};
+use block::CtrWrapper;
 use ctr::Ctr128BE;
 use delegate::delegate;
 use log::trace;
@@ -103,9 +104,9 @@ pub const NONE: Name = Name("none");
 pub(crate) static _CLEAR: Clear = Clear {};
 #[cfg(feature = "des")]
 static _3DES_CBC: SshBlockCipher<CbcWrapper<des::TdesEde3>> = SshBlockCipher(PhantomData);
-static _AES_128_CTR: SshBlockCipher<Ctr128BE<Aes128>> = SshBlockCipher(PhantomData);
-static _AES_192_CTR: SshBlockCipher<Ctr128BE<Aes192>> = SshBlockCipher(PhantomData);
-static _AES_256_CTR: SshBlockCipher<Ctr128BE<Aes256>> = SshBlockCipher(PhantomData);
+static _AES_128_CTR: SshBlockCipher<CtrWrapper<Ctr128BE<Aes128>>> = SshBlockCipher(PhantomData);
+static _AES_192_CTR: SshBlockCipher<CtrWrapper<Ctr128BE<Aes192>>> = SshBlockCipher(PhantomData);
+static _AES_256_CTR: SshBlockCipher<CtrWrapper<Ctr128BE<Aes256>>> = SshBlockCipher(PhantomData);
 static _AES_128_GCM: GcmCipher = GcmCipher(&ALGORITHM_AES_128_GCM);
 static _AES_256_GCM: GcmCipher = GcmCipher(&ALGORITHM_AES_256_GCM);
 static _AES_128_CBC: SshBlockCipher<CbcWrapper<Aes128>> = SshBlockCipher(PhantomData);
@@ -313,6 +314,14 @@ pub(crate) async fn read<R: AsyncRead + Unpin>(
                 return Err(Error::PacketSize(len));
             }
 
+            // A valid packet_length can never be shorter than the block we
+            // already read to probe it; a smaller value would shrink the
+            // buffer below `l` below and panic on the `buffer.buffer[l..]`
+            // slice. Reject it as a protocol error instead.
+            if len + PACKET_LENGTH_LEN < cipher.packet_length_to_read_for_block_length() {
+                return Err(Error::PacketSize(len));
+            }
+
             buffer.len = len + cipher.tag_len();
             trace!("reading, clear len = {:?}", buffer.len);
         }
@@ -362,6 +371,9 @@ const MAXIMUM_PADDING_LEN: usize = 19;
 const MAXIMUM_PACKET_LEN_HEADROOM: usize =
     PADDING_LENGTH_LEN + CHANNEL_EXTENDED_DATA_PACKET_OVERHEAD + MAXIMUM_PADDING_LEN;
 const MAXIMUM_PACKET_LEN: usize = MAXIMUM_PACKET_LEN_BASELINE + MAXIMUM_PACKET_LEN_HEADROOM;
+// Keep post-decompression growth within the same packet-acceptance model as
+// the transport read path.
+pub(crate) const MAXIMUM_DECOMPRESSED_PACKET_LEN: usize = MAXIMUM_PACKET_LEN;
 
 #[cfg(feature = "_bench")]
 pub mod benchmark;

@@ -10,7 +10,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  Build:
+  Semver:
     runs-on: ubuntu-latest
 
     steps:
@@ -21,6 +21,5 @@ jobs:
 
     - name: Check semver compatibility (russh)
       uses: obi1kenobi/cargo-semver-checks-action@v2
-      continue-on-error: true
       with:
         package: russh

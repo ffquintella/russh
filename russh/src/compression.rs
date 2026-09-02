@@ -3,6 +3,9 @@ use std::convert::TryFrom;
 use delegate::delegate;
 use ssh_encoding::Encode;
 
+#[cfg(feature = "flate2")]
+use crate::cipher::MAXIMUM_DECOMPRESSED_PACKET_LEN;
+
 #[derive(Debug, Clone)]
 pub enum Compression {
     None,
@@ -166,6 +169,75 @@ impl Decompress {
     }
 }
 
+#[cfg(all(test, feature = "flate2"))]
+mod tests {
+    use std::io::Write;
+
+    use flate2::write::ZlibEncoder;
+
+    use super::*;
+
+    #[test]
+    fn decompressed_packet_at_limit_is_accepted() {
+        let payload = vec![b'A'; MAXIMUM_DECOMPRESSED_PACKET_LEN];
+        let mut encoder = ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(&payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut decompressor = Decompress::Zlib(flate2::Decompress::new(true));
+        let mut output = Vec::new();
+
+        let decompressed = decompressor.decompress(&compressed, &mut output).unwrap();
+        assert_eq!(decompressed.len(), MAXIMUM_DECOMPRESSED_PACKET_LEN);
+    }
+
+    #[test]
+    fn oversized_decompressed_packet_is_rejected() {
+        let payload = vec![b'A'; MAXIMUM_DECOMPRESSED_PACKET_LEN + 1024];
+        let mut encoder = ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(&payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut decompressor = Decompress::Zlib(flate2::Decompress::new(true));
+        let mut output = Vec::new();
+
+        let err = decompressor.decompress(&compressed, &mut output).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::PacketSize(len) if len > MAXIMUM_DECOMPRESSED_PACKET_LEN)
+        );
+    }
+
+    #[test]
+    fn empty_compressed_packet_does_not_spin() {
+        let compressed = Vec::new();
+        let mut decompressor = Decompress::Zlib(flate2::Decompress::new(true));
+        let mut output = Vec::new();
+
+        let decompressed = decompressor.decompress(&compressed, &mut output).unwrap();
+        assert!(decompressed.is_empty());
+    }
+
+    #[test]
+    fn partial_flush_packets_round_trip() {
+        // Real SSH packets are partial flushes on one continuous stream, not
+        // a finished stream, and routinely decompress to more than twice
+        // their compressed size.
+        let mut comp = Compress::None;
+        let mut decomp = Decompress::None;
+        Compression::Zlib.init_compress(&mut comp);
+        Compression::Zlib.init_decompress(&mut decomp);
+
+        for len in 1..=4096usize {
+            let payload: Vec<u8> = (0..len).map(|i| b"abcdefgh"[i % 8]).collect();
+            let mut cbuf = Vec::new();
+            let compressed = comp.compress(&payload, &mut cbuf).unwrap().to_vec();
+            let mut dbuf = Vec::new();
+            let out = decomp.decompress(&compressed, &mut dbuf).unwrap();
+            assert_eq!(out, payload.as_slice(), "payload of {len} bytes came back wrong");
+        }
+    }
+}
+
 #[cfg(feature = "flate2")]
 impl Compress {
     fn zlib_output_reserve_bound(input_len: usize) -> usize {
@@ -257,7 +329,10 @@ impl Decompress {
                 output.clear();
                 let n_in = z.total_in() as usize;
                 let n_out = z.total_out() as usize;
-                output.resize(input.len(), 0);
+                let max_output_len = MAXIMUM_DECOMPRESSED_PACKET_LEN
+                    .checked_add(1)
+                    .ok_or(crate::Error::PacketSize(usize::MAX))?;
+                output.resize(input.len().clamp(1, max_output_len), 0);
                 let flush = flate2::FlushDecompress::None;
                 loop {
                     let n_in_ = z.total_in() as usize - n_in;
@@ -265,13 +340,34 @@ impl Decompress {
                     #[allow(clippy::indexing_slicing)] // length checked
                     let d = z.decompress(&input[n_in_..], &mut output[n_out_..], flush);
                     match d? {
-                        flate2::Status::Ok => {
-                            output.resize(output.len() * 2, 0);
+                        flate2::Status::Ok | flate2::Status::BufError => {
+                            let consumed_all_input =
+                                z.total_in() as usize - n_in == input.len();
+                            let output_full = z.total_out() as usize - n_out == output.len();
+
+                            if !output_full && consumed_all_input {
+                                break;
+                            }
+
+                            if output_full {
+                                if output.len() == max_output_len {
+                                    break;
+                                }
+                                let next_len = output
+                                    .len()
+                                    .checked_mul(2)
+                                    .map(|len| len.min(max_output_len))
+                                    .ok_or(crate::Error::PacketSize(usize::MAX))?;
+                                output.resize(next_len, 0);
+                            }
                         }
                         _ => break,
                     }
                 }
                 let n_out_ = z.total_out() as usize - n_out;
+                if n_out_ > MAXIMUM_DECOMPRESSED_PACKET_LEN {
+                    return Err(crate::Error::PacketSize(n_out_));
+                }
                 #[allow(clippy::indexing_slicing)] // length checked
                 Ok(&output[..n_out_])
             }

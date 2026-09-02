@@ -1,11 +1,12 @@
 use std::borrow::Cow;
 use std::convert::TryFrom;
 
-use aes::cipher::{BlockDecryptMut, KeyIvInit};
+use aes::cipher::KeyIvInit;
 use aes::*;
 use block_padding::Pkcs7;
-use ssh_key::private::{Ed25519Keypair, Ed25519PrivateKey, KeypairData};
+use cipher::BlockModeDecrypt;
 use ssh_key::PrivateKey;
+use ssh_key::private::{Ed25519Keypair, Ed25519PrivateKey, KeypairData};
 use yasna::BERReaderSeq;
 
 use super::Encryption;
@@ -139,13 +140,13 @@ impl Encryption {
                 #[allow(clippy::unwrap_used)] // parameters are static
                 let c = cbc::Decryptor::<Aes128>::new_from_slices(key, iv).unwrap();
                 let mut dec = ciphertext.to_vec();
-                Ok(c.decrypt_padded_mut::<Pkcs7>(&mut dec)?.into())
+                Ok(c.decrypt_padded::<Pkcs7>(&mut dec)?.into())
             }
             Encryption::Aes256Cbc(ref iv) => {
                 #[allow(clippy::unwrap_used)] // parameters are static
                 let c = cbc::Decryptor::<Aes256>::new_from_slices(key, iv).unwrap();
                 let mut dec = ciphertext.to_vec();
-                Ok(c.decrypt_padded_mut::<Pkcs7>(&mut dec)?.into())
+                Ok(c.decrypt_padded::<Pkcs7>(&mut dec)?.into())
             }
         }
     }
@@ -216,7 +217,8 @@ fn asn1_read_aes256cbc(
     reader: &mut yasna::BERReaderSeq,
 ) -> Result<Result<Encryption, Error>, yasna::ASN1Error> {
     let iv = reader.next().read_bytes()?;
-    let mut i = [0; 16];
-    i.clone_from_slice(&iv);
+    let Ok(i) = <[u8; 16]>::try_from(&iv[..]) else {
+        return Ok(Err(Error::InvalidParameters));
+    };
     Ok(Ok(Encryption::Aes256Cbc(i)))
 }
